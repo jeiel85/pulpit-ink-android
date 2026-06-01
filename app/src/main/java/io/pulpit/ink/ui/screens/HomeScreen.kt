@@ -324,6 +324,7 @@ fun HomeScreen(
         val selectedModel by viewModel.selectedWhisperModel.collectAsState()
         val hapticEnabled by viewModel.isHapticFeedbackEnabled.collectAsState()
         val selectedPreset by viewModel.selectedAudioPreset.collectAsState()
+        val incrementalEnabled by viewModel.isIncrementalTranscriptionEnabled.collectAsState()
         val isKo = java.util.Locale.getDefault().language == "ko"
 
         var currentScreen by remember { mutableStateOf(SettingsScreen.MAIN) }
@@ -521,6 +522,49 @@ fun HomeScreen(
                                         Switch(
                                             checked = hapticEnabled,
                                             onCheckedChange = { viewModel.setHapticFeedbackEnabled(it) },
+                                            colors = SwitchDefaults.colors(
+                                                checkedThumbColor = primaryEmerald,
+                                                checkedTrackColor = primaryEmerald.copy(alpha = 0.5f)
+                                            )
+                                        )
+                                    }
+                                }
+
+                                Spacer(modifier = Modifier.height(12.dp))
+
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = Color(0xFF2B2930)),
+                                    shape = RoundedCornerShape(16.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(16.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text(
+                                                text = if (isKo) "녹음 중 실시간 필기 (실험적)" else "Live transcription while recording (Experimental)",
+                                                style = MaterialTheme.typography.titleMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = deepInk
+                                            )
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Text(
+                                                text = if (isKo)
+                                                    "녹음하는 동안 미리 필기를 진행해, 녹음을 멈추면 거의 기다림 없이 결과가 나옵니다. 최신 기기일수록 부드럽게 동작하며, 배터리·발열이 늘 수 있습니다."
+                                                else
+                                                    "Transcribes as you record so results are ready almost instantly when you stop. Smoothest on recent devices; may increase battery use and heat.",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = softSlate
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Switch(
+                                            checked = incrementalEnabled,
+                                            onCheckedChange = { viewModel.setIncrementalTranscriptionEnabled(it) },
                                             colors = SwitchDefaults.colors(
                                                 checkedThumbColor = primaryEmerald,
                                                 checkedTrackColor = primaryEmerald.copy(alpha = 0.5f)

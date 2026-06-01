@@ -114,6 +114,14 @@ class SermonViewModel(
         context.getSharedPreferences("whisper_prefs", Context.MODE_PRIVATE)
             .getString("selected_audio_preset", "sermon") ?: "sermon"
     )
+
+    // Experimental: transcribe incrementally WHILE recording so results are ready almost
+    // immediately on stop. Default OFF — the proven record-then-transcribe path stays the
+    // default until this is field-verified.
+    val isIncrementalTranscriptionEnabled = MutableStateFlow(
+        context.getSharedPreferences("whisper_prefs", Context.MODE_PRIVATE)
+            .getBoolean("incremental_transcription", false)
+    )
     
     private val _downloadProgress = MutableStateFlow<Map<String, Int>>(emptyMap())
     val downloadProgress = _downloadProgress.asStateFlow()
@@ -233,6 +241,14 @@ class SermonViewModel(
         context.getSharedPreferences("whisper_prefs", Context.MODE_PRIVATE)
             .edit()
             .putString("selected_audio_preset", preset)
+            .apply()
+    }
+
+    fun setIncrementalTranscriptionEnabled(enabled: Boolean) {
+        isIncrementalTranscriptionEnabled.value = enabled
+        context.getSharedPreferences("whisper_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("incremental_transcription", enabled)
             .apply()
     }
 

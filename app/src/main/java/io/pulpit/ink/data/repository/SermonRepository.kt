@@ -316,6 +316,14 @@ class SermonRepository(private val sermonDao: SermonDao) {
         }
     }
 
+    /** Mark a job as actively transcribing (used when the live path claims a job at record start). */
+    suspend fun markJobTranscribing(jobId: String) {
+        withContext(NonCancellable) {
+            val job = sermonDao.getJobById(jobId) ?: return@withContext
+            sermonDao.updateJob(job.copy(status = "Transcribing", errorMessage = null))
+        }
+    }
+
     /**
      * Append a single live "preview" segment as a chunk finishes transcribing during
      * incremental recording, so the detail screen fills in progressively. These preview

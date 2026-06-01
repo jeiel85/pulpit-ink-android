@@ -40,10 +40,12 @@ class LiveTranscriptionController(
 
     @Volatile private var running = false
     @Volatile private var finishing = false
+    @Volatile private var aborted = false
     @Volatile var failed = false
         private set
 
     private var contextPtr = 0L
+    private var modelPath: String? = null
     private var worker: Thread? = null
     private val doneLatch = CountDownLatch(1)
 
@@ -65,18 +67,17 @@ class LiveTranscriptionController(
             Log.w(TAG, "Native whisper not loaded — live transcription unavailable")
             return false
         }
+        // Only a cheap existence check here — the actual (potentially second-long) model
+        // load happens on the worker thread so we never block the caller (recording start).
+        val mgr = WhisperModelManager(context)
         val config = WhisperModelConfig.fromKey(modelKey)
-        val modelFile = WhisperModelManager(context).resolveModelFile(config)
-            ?: WhisperModelConfig.values().firstNotNullOfOrNull { WhisperModelManager(context).resolveModelFile(it) }
+        val modelFile = mgr.resolveModelFile(config)
+            ?: WhisperModelConfig.values().firstNotNullOfOrNull { mgr.resolveModelFile(it) }
         if (modelFile == null) {
             Log.w(TAG, "No downloaded model available — live transcription unavailable")
             return false
         }
-        contextPtr = WhisperLib.initContext(modelFile.absolutePath)
-        if (contextPtr == 0L) {
-            Log.e(TAG, "Failed to init whisper context for live transcription")
-            return false
-        }
+        modelPath = modelFile.absolutePath
 
         running = true
         worker = Thread({ workerLoop() }, "LiveTranscription-worker").apply { start() }
@@ -94,6 +95,15 @@ class LiveTranscriptionController(
         finishing = true
     }
 
+    /**
+     * Abort without finalizing (used when the user discards a recording). The worker stops
+     * promptly and frees the whisper context; no NLP/persist is performed.
+     */
+    fun abort() {
+        aborted = true
+        finishing = true
+    }
+
     /** Block until the worker has finished finalizing (or timed out). */
     fun awaitCompletion(timeoutMs: Long): Boolean =
         doneLatch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -101,22 +111,35 @@ class LiveTranscriptionController(
     private fun workerLoop() {
         val chunkThreshold = chunkSeconds.toLong() * sourceSampleRate
         try {
+            // Load the model here (not on the caller's thread) so recording start is never
+            // blocked by the multi-hundred-millisecond context init.
+            contextPtr = WhisperLib.initContext(modelPath ?: "")
+            if (contextPtr == 0L) {
+                throw IllegalStateException("Failed to initialize whisper context for live transcription")
+            }
             while (true) {
+                if (aborted) break
                 when {
                     queue.available() >= chunkThreshold -> {
-                        queue.pull(chunkThreshold.toInt())?.let { processChunk(it) }
+                        queue.pull(chunkThreshold.toInt())?.let { if (!aborted) processChunk(it) }
                     }
                     finishing -> {
-                        val rest = queue.drainAll()
-                        if (rest.isNotEmpty()) processChunk(rest)
+                        if (!aborted) {
+                            val rest = queue.drainAll()
+                            if (rest.isNotEmpty()) processChunk(rest)
+                        }
                         break
                     }
                     else -> Thread.sleep(150)
                 }
             }
-            // Final NLP + persist. Done even if no chunks produced text (handled as silent).
-            runBlocking { repository.finalizeLiveTranscription(jobId, transcript.toString()) }
-            Log.i(TAG, "Live transcription finalized. transcriptLen=${transcript.length}")
+            if (aborted) {
+                Log.i(TAG, "Live transcription aborted — skipping finalize")
+            } else {
+                // Final NLP + persist. Done even if no chunks produced text (handled as silent).
+                runBlocking { repository.finalizeLiveTranscription(jobId, transcript.toString()) }
+                Log.i(TAG, "Live transcription finalized. transcriptLen=${transcript.length}")
+            }
         } catch (t: Throwable) {
             failed = true
             Log.e(TAG, "Live transcription worker failed", t)
