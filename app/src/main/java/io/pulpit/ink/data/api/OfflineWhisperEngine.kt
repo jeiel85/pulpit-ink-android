@@ -3,8 +3,10 @@ package io.pulpit.ink.data.api
 import android.content.Context
 import android.util.Log
 import io.pulpit.ink.ui.audio.AudioDecoder
+import kotlinx.coroutines.ensureActive
 import java.io.File
 import java.util.Locale
+import kotlin.coroutines.coroutineContext
 
 /**
  * SpeechToTextEngine implementation that transcribes audio fully offline
@@ -38,42 +40,59 @@ class OfflineWhisperEngine(private val context: Context) : SpeechToTextEngine {
                 "Please download the model from settings first."
             )
 
-        // 3. Decode compressed audio (.m4a) to raw PCM Float array
-        Log.d(TAG, "Decoding audio file to PCM...")
-        onInferenceProgress?.invoke(-1)
-        val pcmData = AudioDecoder.decodeToPcm(audioFile, context)
-        if (pcmData.isEmpty()) {
-            // Treat as a valid-but-silent recording instead of erroring out — a brand
-            // new sermon job stuck at "Failed" purely because the user tapped stop
-            // too quickly (or the room was silent) is worse UX than an empty result.
-            Log.w(TAG, "Audio decode produced zero samples — returning empty transcript.")
-            return ""
-        }
-        Log.d(TAG, "Audio successfully decoded. Sample count: ${pcmData.size}")
-
-        // 4. Initialize native Whisper context
+        // 3. Initialize the native Whisper context ONCE and reuse it across all chunks.
+        // The JNI transcribeAudio runs whisper_full with no_context=true, so each chunk is
+        // decoded independently and returns only its own text — safe to call repeatedly.
         Log.d(TAG, "Initializing Whisper native context with model: ${modelFile.name}")
-        onInferenceProgress?.invoke(-2)
+        onInferenceProgress?.invoke(-1) // "decoding audio" stage hint
+        onInferenceProgress?.invoke(-2) // "loading model" stage hint
         val contextPtr = WhisperLib.initContext(modelFile.absolutePath)
         if (contextPtr == 0L) {
             throw IllegalStateException("Failed to initialize native Whisper context with model: ${modelFile.absolutePath}")
         }
 
-        // 5. Transcribe raw float samples safely inside a try-finally block to prevent native memory leaks
-        try {
-            Log.d(TAG, "Executing native Whisper inference...")
-            val systemLanguage = Locale.getDefault().language
-            val effectiveLanguage = if (systemLanguage.isNotBlank()) systemLanguage else "auto"
+        val systemLanguage = Locale.getDefault().language
+        val effectiveLanguage = if (systemLanguage.isNotBlank()) systemLanguage else "auto"
+        // Capture the calling coroutine context so we can honor cancellation between
+        // chunks from inside the (non-suspend) decode callback.
+        val cc = coroutineContext
+        val transcript = StringBuilder()
 
-            val callback = onInferenceProgress?.let { sink ->
-                object : WhisperLib.ProgressCallback {
-                    override fun onProgress(percent: Int) = sink(percent)
+        // 4. Stream-decode the audio in bounded chunks, transcribing each as it arrives.
+        // This caps peak memory regardless of recording length (see AudioDecoder).
+        try {
+            AudioDecoder.decodeToPcmStreaming(audioFile, context) { chunkPcm, processedSec, totalSec ->
+                cc.ensureActive() // throws CancellationException if the job was cancelled
+
+                val chunkLenSec = chunkPcm.size / 16000.0
+                val chunkStartSec = (processedSec - chunkLenSec).coerceAtLeast(0.0)
+
+                val callback = onInferenceProgress?.let { sink ->
+                    object : WhisperLib.ProgressCallback {
+                        override fun onProgress(percent: Int) {
+                            // Map this chunk's 0..100 onto the overall clip timeline so the
+                            // notification progresses smoothly across the whole recording.
+                            val overall = if (totalSec > 0.0) {
+                                val sec = chunkStartSec + (percent / 100.0) * chunkLenSec
+                                ((sec / totalSec) * 100.0).toInt().coerceIn(0, 100)
+                            } else {
+                                percent.coerceIn(0, 100)
+                            }
+                            sink(overall)
+                        }
+                    }
+                }
+
+                val chunkText = WhisperLib.transcribeAudio(contextPtr, chunkPcm, effectiveLanguage, callback)
+                if (chunkText.isNotBlank()) {
+                    if (transcript.isNotEmpty()) transcript.append("\n\n")
+                    transcript.append(chunkText.trim())
                 }
             }
-
-            val resultText = WhisperLib.transcribeAudio(contextPtr, pcmData, effectiveLanguage, callback)
-            Log.i(TAG, "Offline transcription completed successfully.")
-            return resultText
+            Log.i(TAG, "Offline transcription completed. Total transcript length: ${transcript.length}")
+            // A blank transcript means no speech was recognized (silent/very short clip);
+            // the repository treats that as a successful no-op rather than a failure.
+            return transcript.toString()
         } finally {
             Log.d(TAG, "Safely releasing native Whisper context pointer: $contextPtr")
             WhisperLib.freeContext(contextPtr)

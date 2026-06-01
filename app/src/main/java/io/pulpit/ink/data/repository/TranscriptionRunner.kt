@@ -69,6 +69,11 @@ object TranscriptionRunner {
                     Log.e(TAG, "Transcription crashed for job $jobId", t)
                     withContext(NonCancellable) {
                         repository.markJobFailed(jobId, t.localizedMessage ?: "Transcription crashed")
+                        // Backstop: if a Throwable escaped transcribeJob's own handler
+                        // (e.g. failure during pre-flight, or an OOM inside that handler),
+                        // make sure no stuck progress notification is left behind.
+                        io.pulpit.ink.data.text.TranscriptionNotificationHelper
+                            .dismissNotification(appContext, jobId)
                     }
                 } finally {
                     synchronized(this@TranscriptionRunner) {

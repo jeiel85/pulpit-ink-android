@@ -285,27 +285,31 @@ class SermonRepository(private val sermonDao: SermonDao) {
                 if (isKo) "가공 완료!" else "Transcription successful!"
             )
             return@withContext true
-        } catch (e: Exception) {
-            val isCancelled = e is kotlinx.coroutines.CancellationException
-            val errorMsg = if (isCancelled) {
-                if (isKo) "사용자가 필기 분석을 중단했습니다." else "Transcription was cancelled by user."
-            } else {
-                e.localizedMessage ?: "Transcription failed"
+        } catch (t: Throwable) {
+            // Catch Throwable, not just Exception: OutOfMemoryError (the most common
+            // failure on long recordings / low-memory devices) is an Error, so a
+            // `catch (Exception)` would silently miss it — leaving the ongoing progress
+            // notification frozen in the status bar and never marking the job failed here.
+            val isCancelled = t is kotlinx.coroutines.CancellationException
+            val errorMsg = when {
+                isCancelled ->
+                    if (isKo) "사용자가 필기 분석을 중단했습니다." else "Transcription was cancelled by user."
+                t is OutOfMemoryError ->
+                    if (isKo) "기기 메모리가 부족해 전사를 완료하지 못했습니다. 녹음이 너무 길거나 다른 앱이 메모리를 많이 쓰고 있을 수 있어요. 다른 앱을 닫고 다시 시도해 주세요."
+                    else "Ran out of memory while transcribing. The recording may be too long or other apps are using too much memory. Close other apps and try again."
+                else -> t.localizedMessage ?: "Transcription failed"
             }
-            
+
             withContext(NonCancellable) {
                 markJobFailed(jobId, errorMsg)
             }
-            
-            TranscriptionNotificationHelper.showProgressNotification(
-                context, jobId, title, 100,
-                if (isCancelled) {
-                    if (isKo) "필기 분석 중단됨" else "Transcription cancelled"
-                } else {
-                    if (isKo) "필기 분석 실패" else "Transcription failed"
-                }
-            )
-            if (e is kotlinx.coroutines.CancellationException) throw e
+
+            // On any terminal failure/cancellation, REMOVE the status-bar progress
+            // notification rather than leaving a stuck/ongoing entry behind. The failure
+            // is already surfaced in-app on the detail screen.
+            TranscriptionNotificationHelper.dismissNotification(context, jobId)
+
+            if (t is kotlinx.coroutines.CancellationException) throw t
             return@withContext false
         } finally {
             clearProgress(jobId)
