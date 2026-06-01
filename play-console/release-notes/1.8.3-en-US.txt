@@ -1,0 +1,7 @@
+You can now transcribe while recording (experimental).
+
+• Turn on "Live transcription while recording" in Settings to transcribe as you record, so your result is ready almost instantly when you stop.
+• Works best on recent devices, and may increase battery use and heat.
+• The classic record-then-transcribe mode still works and remains the default.
+
+Your recordings and transcripts stay entirely on your device.
