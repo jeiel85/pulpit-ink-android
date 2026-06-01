@@ -1,0 +1,7 @@
+Long sermons now transcribe reliably from start to finish.
+
+• Fixed an issue where transcription could stop partway through long recordings (30 minutes to over an hour). Lengthy sermons now finish without running out of memory.
+• If something goes wrong during transcription, the status-bar progress notification now clears itself instead of staying stuck.
+• General stability improvements.
+
+Your recordings and transcripts stay entirely on your device.
