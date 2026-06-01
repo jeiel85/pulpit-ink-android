@@ -11,6 +11,7 @@ import androidx.core.app.NotificationCompat
 import io.pulpit.ink.MainActivity
 import io.pulpit.ink.R
 import io.pulpit.ink.data.db.AppDatabase
+import io.pulpit.ink.data.repository.LiveTranscriptionController
 import io.pulpit.ink.data.repository.SermonRepository
 import io.pulpit.ink.data.repository.TranscriptionRunner
 import kotlinx.coroutines.*
@@ -42,6 +43,14 @@ class AudioRecordingService : Service() {
     
     private var recordTitle: String = ""
     private var recordTopic: String = ""
+
+    // --- Incremental ("live") transcription path (behind the incremental_transcription flag) ---
+    private var incremental = false
+    private var recordTempTitle: String = ""
+    private var pcmRecorder: PcmAudioRecorder? = null
+    private var liveController: LiveTranscriptionController? = null
+    private var liveJobId: String? = null
+    private var liveWavFile: File? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -81,44 +90,112 @@ class AudioRecordingService : Service() {
         recordTopic = topic.trim()
 
         val tempTitle = "Sermon_Rec_${System.currentTimeMillis()}"
-        val recordFile = audioEngine.startRecording(tempTitle)
-        
+        recordTempTitle = tempTitle
+
+        incremental = applicationContext
+            .getSharedPreferences("whisper_prefs", Context.MODE_PRIVATE)
+            .getBoolean("incremental_transcription", false)
+
+        var recordFile: File? = null
+        if (incremental) {
+            recordFile = startIncrementalCapture(tempTitle)
+            if (recordFile == null) {
+                // Live path unavailable (e.g. no model downloaded) — fall back to the
+                // proven record-then-transcribe path so recording always works.
+                Log.w(TAG, "Incremental capture unavailable; falling back to MediaRecorder")
+                incremental = false
+            }
+        }
+        if (recordFile == null) {
+            recordFile = audioEngine.startRecording(tempTitle)
+        }
+
         if (recordFile != null) {
             _isRecording.value = true
             _durationSec.value = 0.0
             _capturedFile.value = recordFile
-
-            // Initialize MediaSession for Samsung/Android Quick Panel Integration
-            setupMediaSession(title, topic)
-
-            // Create notification channel and start foreground service
-            createNotificationChannel()
-            val notification = buildRecordingNotification(0.0)
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIFICATION_ID, 
-                    notification, 
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-                )
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
-
-            // Start timer job to update duration
-            timerJob?.cancel()
-            timerJob = serviceScope.launch {
-                while (isActive) {
-                    delay(1000)
-                    _durationSec.value += 1.0
-                    updateNotification(_durationSec.value)
-                }
-            }
-            Log.d(TAG, "Foreground recording service started successfully")
+            beginForegroundSession(title, topic)
+            Log.d(TAG, "Foreground recording service started (incremental=$incremental)")
         } else {
             Log.e(TAG, "Failed to start recording inside service")
+            cleanupIncremental()
             stopSelf()
         }
+    }
+
+    /** Shared MediaSession + foreground notification + duration timer setup. */
+    private fun beginForegroundSession(title: String, topic: String) {
+        setupMediaSession(title, topic)
+        createNotificationChannel()
+        val notification = buildRecordingNotification(0.0)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+        timerJob?.cancel()
+        timerJob = serviceScope.launch {
+            while (isActive) {
+                delay(1000)
+                _durationSec.value += 1.0
+                updateNotification(_durationSec.value)
+            }
+        }
+    }
+
+    /**
+     * Live-transcription capture path: AudioRecord -> temp WAV, with a
+     * LiveTranscriptionController consuming PCM as it is captured. The job is created up
+     * front so live preview segments can attach. Returns the WAV file, or null if the live
+     * path can't start (caller falls back to MediaRecorder).
+     */
+    private fun startIncrementalCapture(tempTitle: String): File? {
+        val isKo = Locale.getDefault().language == "ko"
+        val prefs = applicationContext.getSharedPreferences("whisper_prefs", Context.MODE_PRIVATE)
+        val modelKey = prefs.getString("selected_model", "base") ?: "base"
+        val finalTitle = recordTitle.ifBlank { if (isKo) "무제 설교" else "Untitled Sermon" }
+        val wav = File(cacheDir, "$tempTitle.wav")
+
+        val jobId = try {
+            runBlocking {
+                val id = repository.createNewJob(finalTitle, wav.absolutePath, 0.0)
+                repository.markJobTranscribing(id)
+                id
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Failed to create live job", t)
+            return null
+        }
+
+        val controller = LiveTranscriptionController(applicationContext, jobId, modelKey, 44_100, 120)
+        if (!controller.start()) {
+            runBlocking { repository.deleteJob(jobId) }
+            return null
+        }
+
+        val rec = PcmAudioRecorder(44_100, 1)
+        val started = rec.start(wav) { samples, count -> controller.feed(samples, count) }
+        if (!started) {
+            controller.abort()
+            controller.awaitCompletion(3000)
+            runBlocking { repository.deleteJob(jobId) }
+            wav.delete()
+            return null
+        }
+
+        pcmRecorder = rec
+        liveController = controller
+        liveJobId = jobId
+        liveWavFile = wav
+        return wav
+    }
+
+    private fun cleanupIncremental() {
+        pcmRecorder = null
+        liveController = null
+        liveJobId = null
+        liveWavFile = null
+        incremental = false
     }
 
     private fun setupMediaSession(title: String, topic: String) {
@@ -191,6 +268,11 @@ class AudioRecordingService : Service() {
             return
         }
 
+        if (incremental) {
+            stopIncrementalAndSave()
+            return
+        }
+
         timerJob?.cancel()
         timerJob = null
 
@@ -242,6 +324,10 @@ class AudioRecordingService : Service() {
     }
 
     private fun cancelRecordingService() {
+        if (incremental) {
+            cancelIncremental()
+            return
+        }
         timerJob?.cancel()
         timerJob = null
         audioEngine.stopRecording()
@@ -255,6 +341,97 @@ class AudioRecordingService : Service() {
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         Log.d(TAG, "Foreground recording service cancelled and stopped")
+    }
+
+    /**
+     * Stop + save the live-transcription recording: finalize the WAV, transcode it to the
+     * compact .m4a used for storage/playback, then let the controller finish the trailing
+     * chunk + NLP. Heavy work runs on IO to avoid blocking the main thread (ANR).
+     */
+    private fun stopIncrementalAndSave() {
+        timerJob?.cancel()
+        timerJob = null
+
+        val dur = pcmRecorder?.stop() ?: 0.0
+        val wav = liveWavFile
+        val jobId = liveJobId
+        val controller = liveController
+        val tempTitle = recordTempTitle
+
+        _isRecording.value = false
+        releaseMediaSession()
+        // Detach session state immediately so a new recording can't collide with teardown.
+        pcmRecorder = null
+        liveController = null
+        liveJobId = null
+        liveWavFile = null
+
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                // Navigate to the (already-populating) detail screen.
+                if (jobId != null) _newJobIdFlow.emit(jobId)
+
+                // Transcode the temp WAV to the compact m4a used for storage + playback.
+                if (wav != null && jobId != null) {
+                    var audioPath = wav.absolutePath
+                    val m4a = File(cacheDir, "$tempTitle.m4a")
+                    val ok = AudioFileEncoder.encodeWavToM4a(wav, m4a)
+                    if (ok) audioPath = m4a.absolutePath
+                    // Set audio path + duration BEFORE the controller finalizes, since the
+                    // finalize step splits segments using the job's duration.
+                    repository.updateJobAudio(jobId, audioPath, dur)
+                    if (ok) wav.delete()
+                }
+
+                // Finish the trailing chunk + run NLP, then the controller frees its context.
+                controller?.stop()
+                controller?.awaitCompletion(10 * 60 * 1000)
+            } catch (e: Exception) {
+                Log.e(TAG, "Error finalizing incremental recording", e)
+            } finally {
+                incremental = false
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        }
+    }
+
+    /** Discard a live-transcription recording: abort transcription (no NLP), delete job + files. */
+    private fun cancelIncremental() {
+        timerJob?.cancel()
+        timerJob = null
+        pcmRecorder?.stop()
+
+        val controller = liveController
+        val jobId = liveJobId
+        val wav = liveWavFile
+        val tempTitle = recordTempTitle
+
+        _isRecording.value = false
+        _durationSec.value = 0.0
+        _capturedFile.value = null
+        releaseMediaSession()
+        pcmRecorder = null
+        liveController = null
+        liveJobId = null
+        liveWavFile = null
+
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                controller?.abort()
+                controller?.awaitCompletion(5000)
+                if (jobId != null) repository.deleteJob(jobId)
+                wav?.delete()
+                File(cacheDir, "$tempTitle.m4a").delete()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error cancelling incremental recording", e)
+            } finally {
+                incremental = false
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                Log.d(TAG, "Incremental recording cancelled and discarded")
+            }
+        }
     }
 
     private fun createNotificationChannel() {

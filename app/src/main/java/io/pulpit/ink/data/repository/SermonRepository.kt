@@ -316,6 +316,98 @@ class SermonRepository(private val sermonDao: SermonDao) {
         }
     }
 
+    /** Mark a job as actively transcribing (used when the live path claims a job at record start). */
+    suspend fun markJobTranscribing(jobId: String) {
+        withContext(NonCancellable) {
+            val job = sermonDao.getJobById(jobId) ?: return@withContext
+            sermonDao.updateJob(job.copy(status = "Transcribing", errorMessage = null))
+        }
+    }
+
+    /**
+     * Append a single live "preview" segment as a chunk finishes transcribing during
+     * incremental recording, so the detail screen fills in progressively. These preview
+     * segments are replaced by the properly-structured ones in [finalizeLiveTranscription].
+     */
+    suspend fun appendLiveSegment(jobId: String, startSec: Double, endSec: Double, text: String) {
+        if (text.isBlank()) return
+        val isKo = Locale.getDefault().language == "ko"
+        sermonDao.insertSegments(
+            listOf(
+                SermonSegment(
+                    jobId = jobId,
+                    startSec = startSec,
+                    endSec = endSec,
+                    text = text.trim(),
+                    speaker = if (isKo) "설교자" else "Preacher"
+                )
+            )
+        )
+    }
+
+    /**
+     * Finalize an incrementally-transcribed recording: clean + correct the accumulated raw
+     * transcript, run the offline NLP (title/summary/outline/refs/nouns/keywords) once, and
+     * persist the final job + structured segments. Mirrors the tail of [transcribeJob] so
+     * live and post-hoc transcription converge on an identical final result. Runs
+     * NonCancellable so a late teardown can't strand the job mid-write.
+     */
+    suspend fun finalizeLiveTranscription(jobId: String, rawTranscript: String): Boolean =
+        withContext(Dispatchers.IO + NonCancellable) {
+            val job = sermonDao.getJobById(jobId) ?: return@withContext false
+            val isKo = Locale.getDefault().language == "ko"
+
+            val cleaned = TranscriptCleaner.clean(rawTranscript)
+            val corrected = OfflineTextProcessor.correctTranscript(cleaned)
+
+            if (corrected.isBlank()) {
+                sermonDao.updateJob(
+                    job.copy(
+                        status = "Done",
+                        errorMessage = null,
+                        summary = if (isKo) "음성에서 인식된 내용이 없어 요약을 생성하지 않았습니다." else "No speech was recognized; nothing to summarize.",
+                        outline = null, bibleRefs = null, properNouns = null, keywords = null
+                    )
+                )
+                writePlaceholderSegment(jobId, job.durationSec, isKo)
+                return@withContext true
+            }
+
+            val finalTitle = computeOfflineTitle(job.title, corrected)
+            val summary = OfflineTextProcessor.generateSummary(finalTitle, corrected)
+            val refs = OfflineTextProcessor.extractBibleReferences(corrected)
+            val outline = OfflineTextProcessor.generateSermonOutline(finalTitle, corrected, refs)
+            val nouns = OfflineTextProcessor.extractProperNouns(corrected)
+            val keywords = OfflineTextProcessor.extractKeywords(corrected)
+
+            sermonDao.updateJob(
+                job.copy(
+                    title = finalTitle,
+                    status = "Done",
+                    errorMessage = null,
+                    summary = summary,
+                    outline = outline,
+                    bibleRefs = refs,
+                    properNouns = nouns,
+                    keywords = keywords
+                )
+            )
+            // Replaces the live preview segments with the final paragraph-structured ones.
+            writeSegments(jobId, job.durationSec, corrected)
+            true
+        }
+
+    /**
+     * Update only a job's audio path + duration (used after the live recorder transcodes
+     * the temporary WAV to the final .m4a on stop).
+     */
+    suspend fun updateJobAudio(jobId: String, audioPath: String, durationSec: Double) {
+        withContext(NonCancellable) {
+            val job = sermonDao.getJobById(jobId) ?: return@withContext
+            sermonDao.updateJob(job.copy(audioPath = audioPath, durationSec = durationSec))
+        }
+    }
+
     /**
      * Re-run correction on the existing transcript segments entirely offline.
      */

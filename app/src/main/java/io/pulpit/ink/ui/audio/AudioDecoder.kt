@@ -211,6 +211,23 @@ object AudioDecoder {
     private fun processChunk(buffer: ShortPcmBuffer, sourceRate: Int, preset: String): FloatArray {
         val rawPcm = resampleAndNormalize(buffer.backing, buffer.size, sourceRate)
         if (rawPcm.isEmpty()) return rawPcm
+        return applyPreset(rawPcm, preset)
+    }
+
+    /**
+     * Public entry point for the LIVE (incremental) path: resample one mono source-rate
+     * PCM slice (`samples[0 until count]`) to 16kHz and apply [preset]. Lets the live
+     * transcriber reuse the exact same resample + DSP the batch decode path uses, so live
+     * and post-hoc transcription feed whisper identical audio.
+     */
+    fun processPcmChunk(samples: ShortArray, count: Int, sourceRate: Int, preset: String): FloatArray {
+        val rawPcm = resampleAndNormalize(samples, count, sourceRate)
+        if (rawPcm.isEmpty()) return rawPcm
+        return applyPreset(rawPcm, preset)
+    }
+
+    /** Apply the selected DSP preset to a 16kHz float chunk (high/low-pass run in place). */
+    private fun applyPreset(rawPcm: FloatArray, preset: String): FloatArray {
         val rate = TARGET_SAMPLE_RATE.toFloat()
         return when (preset) {
             "stt_basic" -> {
